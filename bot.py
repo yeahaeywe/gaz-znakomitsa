@@ -13,19 +13,35 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
+    PreCheckoutQuery,
+    LabeledPrice,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+
+# ==================================================
+# CONFIG
+# ==================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = None
 db = None
+
 dp = Dispatcher(storage=MemoryStorage())
 
+SUPPORT_AMOUNTS = {
+    "support_10": 10,
+    "support_25": 25,
+    "support_50": 50,
+    "support_100": 100,
+}
 
-# -------------------- РЕГИСТРАЦИЯ --------------------
+
+# ==================================================
+# REGISTRATION STATES
+# ==================================================
 
 class ProfileForm(StatesGroup):
     name = State()
@@ -37,37 +53,110 @@ class ProfileForm(StatesGroup):
 AGE_GROUPS = {"13-15", "16-17", "18+"}
 
 
+# ==================================================
+# KEYBOARDS
+# ==================================================
+
 def menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔎 Найти собеседника", callback_data="browse"
-        )],
-        [InlineKeyboardButton(
-            text="💬 Мои чаты", callback_data="chats"
-        )],
-        [InlineKeyboardButton(
-            text="👤 Моя анкета", callback_data="myprofile"
-        )],
         [
             InlineKeyboardButton(
-                text="👁 Скрыть анкету", callback_data="hide"
+                text="🔎 Найти собеседника",
+                callback_data="browse",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💬 Мои чаты",
+                callback_data="chats",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="👤 Моя анкета",
+                callback_data="myprofile",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="👁 Скрыть анкету",
+                callback_data="hide",
             ),
             InlineKeyboardButton(
-                text="🌟 Показывать анкету", callback_data="show"
+                text="🌟 Показывать анкету",
+                callback_data="show",
             ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ Поддержка ❤️",
+                callback_data="support",
+            )
         ],
     ])
 
 
 def age_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="13–15", callback_data="age:13-15")],
-        [InlineKeyboardButton(text="16–17", callback_data="age:16-17")],
-        [InlineKeyboardButton(text="18+", callback_data="age:18+")],
+        [
+            InlineKeyboardButton(
+                text="13–15",
+                callback_data="age:13-15",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="16–17",
+                callback_data="age:16-17",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="18+",
+                callback_data="age:18+",
+            )
+        ],
     ])
 
 
-# -------------------- POSTGRESQL --------------------
+def support_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="⭐ 10 Stars",
+                callback_data="support_10",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ 25 Stars",
+                callback_data="support_25",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ 50 Stars",
+                callback_data="support_50",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ 100 Stars",
+                callback_data="support_100",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ В меню",
+                callback_data="mainmenu",
+            )
+        ],
+    ])
+
+
+# ==================================================
+# POSTGRESQL DATABASE
+# ==================================================
 
 async def init_db():
     await db.execute("""
@@ -122,6 +211,19 @@ async def init_db():
         )
     """)
 
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS donations (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            telegram_charge_id TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    print("PostgreSQL tables are ready.")
+
 
 async def get_profile(user_id):
     return await db.fetchrow(
@@ -131,18 +233,18 @@ async def get_profile(user_id):
 
 
 async def is_blocked(user1, user2):
-    result = await db.fetchval("""
+    return await db.fetchval("""
         SELECT EXISTS(
             SELECT 1 FROM blocks
             WHERE (from_id = $1 AND to_id = $2)
                OR (from_id = $2 AND to_id = $1)
         )
     """, user1, user2)
-    return result
 
 
 async def has_match(user1, user2):
     a, b = sorted((user1, user2))
+
     return await db.fetchval("""
         SELECT EXISTS(
             SELECT 1 FROM matches
@@ -152,26 +254,31 @@ async def has_match(user1, user2):
 
 
 async def close_chat_sessions(user_id):
-    partner = await db.fetchval(
-        "SELECT partner_id FROM chat_sessions WHERE user_id = $1",
-        user_id,
-    )
+    partner = await db.fetchval("""
+        SELECT partner_id
+        FROM chat_sessions
+        WHERE user_id = $1
 
-    await db.execute(
-        "DELETE FROM chat_sessions WHERE user_id = $1",
-        user_id,
-    )
+        UNION ALL
 
-    if partner is not None:
-        await db.execute(
-            "DELETE FROM chat_sessions WHERE user_id = $1",
-            partner,
-        )
+        SELECT user_id
+        FROM chat_sessions
+        WHERE partner_id = $1
+
+        LIMIT 1
+    """, user_id)
+
+    await db.execute("""
+        DELETE FROM chat_sessions
+        WHERE user_id = $1 OR partner_id = $1
+    """, user_id)
 
     return partner
 
 
-# -------------------- СТАРТ --------------------
+# ==================================================
+# START AND REGISTRATION
+# ==================================================
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
@@ -189,10 +296,12 @@ async def start(message: Message, state: FSMContext):
 
     await message.answer(
         "💜 Добро пожаловать в VibeMatch!\n\n"
-        "Здесь можно найти друзей и собеседников по интересам.\n"
-        "Не публикуй телефон, адрес, пароли и другие личные данные.\n\n"
+        "Здесь можно находить друзей и собеседников.\n"
+        "Не публикуй пароли, адрес, телефон и другие "
+        "личные данные.\n\n"
         "Как тебя называть?"
     )
+
     await state.set_state(ProfileForm.name)
 
 
@@ -207,11 +316,12 @@ async def form_name(message: Message, state: FSMContext):
         return
 
     await state.update_data(name=name)
+
     await message.answer(
-        "Выбери свою возрастную группу. "
-        "Анкеты показываются только внутри той же группы.",
+        "Выбери возрастную группу:",
         reply_markup=age_keyboard(),
     )
+
     await state.set_state(ProfileForm.age_group)
 
 
@@ -220,12 +330,19 @@ async def form_age(callback: CallbackQuery, state: FSMContext):
     age_group = callback.data.split(":", 1)[1]
 
     if age_group not in AGE_GROUPS:
-        await callback.answer("Неверная возрастная группа.", show_alert=True)
+        await callback.answer(
+            "Неверная возрастная группа.",
+            show_alert=True,
+        )
         return
 
     await state.update_data(age_group=age_group)
+
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("Напиши свои интересы через запятую.")
+    await callback.message.answer(
+        "Напиши свои интересы через запятую."
+    )
+
     await state.set_state(ProfileForm.interests)
     await callback.answer()
 
@@ -241,10 +358,12 @@ async def form_interests(message: Message, state: FSMContext):
         return
 
     await state.update_data(interests=interests)
+
     await message.answer(
-        "Напиши короткое описание себя (до 300 символов).\n"
-        "Не указывай телефон, адрес или пароли."
+        "Расскажи немного о себе (до 300 символов).\n"
+        "Не указывай личные контакты."
     )
+
     await state.set_state(ProfileForm.bio)
 
 
@@ -254,7 +373,7 @@ async def form_bio(message: Message, state: FSMContext):
 
     if len(bio) > 300:
         await message.answer(
-            "Описание слишком длинное. Максимум 300 символов."
+            "Максимальная длина описания — 300 символов."
         )
         return
 
@@ -279,28 +398,35 @@ async def form_bio(message: Message, state: FSMContext):
     )
 
     await state.clear()
+
     await message.answer(
-        "✅ Анкета сохранена в PostgreSQL!",
+        "✅ Анкета сохранена!\n"
+        "Теперь можно искать собеседников.",
         reply_markup=menu(),
     )
 
 
-# -------------------- МОЯ АНКЕТА --------------------
+# ==================================================
+# PROFILE
+# ==================================================
 
 @dp.callback_query(F.data == "myprofile")
 async def myprofile(callback: CallbackQuery):
     p = await get_profile(callback.from_user.id)
 
     if not p:
-        await callback.message.answer("Сначала создай анкету: /start")
+        await callback.message.answer(
+            "Сначала создай анкету: /start"
+        )
     else:
         status = "видна" if p["visible"] else "скрыта"
+
         await callback.message.answer(
             f"👤 {p['name']}\n"
             f"Возрастная группа: {p['age_group']}\n"
             f"Интересы: {p['interests']}\n"
             f"О себе: {p['bio'] or 'Не указано'}\n"
-            f"Статус: {status}",
+            f"Статус анкеты: {status}",
             reply_markup=menu(),
         )
 
@@ -309,37 +435,57 @@ async def myprofile(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "hide")
 async def hide_profile(callback: CallbackQuery):
-    await db.execute(
-        "UPDATE profiles SET visible = FALSE WHERE user_id = $1",
-        callback.from_user.id,
-    )
+    await db.execute("""
+        UPDATE profiles
+        SET visible = FALSE
+        WHERE user_id = $1
+    """, callback.from_user.id)
+
     await callback.message.answer(
-        "👁 Анкета скрыта.",
+        "👁 Твоя анкета скрыта.",
         reply_markup=menu(),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data == "show")
 async def show_profile(callback: CallbackQuery):
-    profile = await get_profile(callback.from_user.id)
+    p = await get_profile(callback.from_user.id)
 
-    if not profile:
-        await callback.answer("Сначала создай анкету через /start", show_alert=True)
+    if not p:
+        await callback.answer(
+            "Сначала создай анкету через /start.",
+            show_alert=True,
+        )
         return
 
-    await db.execute(
-        "UPDATE profiles SET visible = TRUE WHERE user_id = $1",
-        callback.from_user.id,
-    )
+    await db.execute("""
+        UPDATE profiles
+        SET visible = TRUE
+        WHERE user_id = $1
+    """, callback.from_user.id)
+
     await callback.message.answer(
-        "💜 Анкета снова видна.",
+        "🌟 Анкета снова видна.",
+        reply_markup=menu(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mainmenu")
+async def main_menu_callback(callback: CallbackQuery):
+    await callback.message.answer(
+        "💜 Главное меню VibeMatch:",
         reply_markup=menu(),
     )
     await callback.answer()
 
 
-# -------------------- ПОИСК АНКЕТ --------------------
+# ==================================================
+# FIND PROFILES
+# ==================================================
 
 @dp.callback_query(F.data == "browse")
 async def browse(callback: CallbackQuery):
@@ -347,7 +493,9 @@ async def browse(callback: CallbackQuery):
     me = await get_profile(uid)
 
     if not me:
-        await callback.message.answer("Сначала создай анкету: /start")
+        await callback.message.answer(
+            "Сначала создай анкету: /start"
+        )
         await callback.answer()
         return
 
@@ -375,41 +523,45 @@ async def browse(callback: CallbackQuery):
             "Пока нет новых анкет. Попробуй позже 💜",
             reply_markup=menu(),
         )
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💜 Нравится",
-                    callback_data=f"like:{p['user_id']}",
-                ),
-                InlineKeyboardButton(
-                    text="➡️ Дальше",
-                    callback_data="browse",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚫 Заблокировать",
-                    callback_data=f"block:{p['user_id']}",
-                ),
-                InlineKeyboardButton(
-                    text="⚠️ Жалоба",
-                    callback_data=f"report:{p['user_id']}",
-                ),
-            ],
-        ])
+        await callback.answer()
+        return
 
-        await callback.message.answer(
-            f"💜 {p['name']}\n"
-            f"Интересы: {p['interests']}\n"
-            f"О себе: {p['bio'] or 'Не указано'}",
-            reply_markup=kb,
-        )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="💜 Нравится",
+                callback_data=f"like:{p['user_id']}",
+            ),
+            InlineKeyboardButton(
+                text="➡️ Дальше",
+                callback_data="browse",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🚫 Заблокировать",
+                callback_data=f"block:{p['user_id']}",
+            ),
+            InlineKeyboardButton(
+                text="⚠️ Жалоба",
+                callback_data=f"report:{p['user_id']}",
+            ),
+        ],
+    ])
+
+    await callback.message.answer(
+        f"💜 {p['name']}\n"
+        f"Интересы: {p['interests']}\n"
+        f"О себе: {p['bio'] or 'Не указано'}",
+        reply_markup=kb,
+    )
 
     await callback.answer()
 
 
-# -------------------- ЛАЙКИ И ВЗАИМНОСТЬ --------------------
+# ==================================================
+# LIKES AND MATCHES
+# ==================================================
 
 @dp.callback_query(F.data.startswith("like:"))
 async def like_profile(callback: CallbackQuery):
@@ -418,26 +570,41 @@ async def like_profile(callback: CallbackQuery):
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer("Некорректная анкета.", show_alert=True)
+        await callback.answer(
+            "Некорректная анкета.",
+            show_alert=True,
+        )
         return
 
     if uid == target:
-        await callback.answer("Это твоя анкета.", show_alert=True)
+        await callback.answer(
+            "Это твоя анкета.",
+            show_alert=True,
+        )
         return
 
     me = await get_profile(uid)
     other = await get_profile(target)
 
     if not me or not other or not other["visible"]:
-        await callback.answer("Анкета больше недоступна.", show_alert=True)
+        await callback.answer(
+            "Анкета больше недоступна.",
+            show_alert=True,
+        )
         return
 
     if me["age_group"] != other["age_group"]:
-        await callback.answer("Возрастные группы не совпадают.", show_alert=True)
+        await callback.answer(
+            "Возрастные группы не совпадают.",
+            show_alert=True,
+        )
         return
 
     if await is_blocked(uid, target):
-        await callback.answer("Взаимодействие недоступно.", show_alert=True)
+        await callback.answer(
+            "Взаимодействие недоступно.",
+            show_alert=True,
+        )
         return
 
     await db.execute("""
@@ -453,50 +620,58 @@ async def like_profile(callback: CallbackQuery):
         )
     """, target, uid)
 
-    if mutual:
-        a, b = sorted((uid, target))
+    if not mutual:
+        await callback.answer("Лайк отправлен 💜")
+        return
 
-        await db.execute("""
-            INSERT INTO matches (user1, user2)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-        """, a, b)
+    a, b = sorted((uid, target))
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
+    await db.execute("""
+        INSERT INTO matches (user1, user2)
+        VALUES ($1, $2)
+        ON CONFLICT DO NOTHING
+    """, a, b)
+
+    kb_for_me = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
                 text="💬 Открыть чат",
                 callback_data=f"openchat:{target}",
-            )]
-        ])
+            )
+        ]
+    ])
 
-        await callback.message.answer(
-            "🎉 Взаимная симпатия! Вы оба хотите познакомиться.\n"
-            "Чтобы начать переписку, открой чат.",
-            reply_markup=kb,
-        )
-
-        other_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
+    kb_for_other = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
                 text="💬 Открыть чат",
                 callback_data=f"openchat:{uid}",
-            )]
-        ])
-
-        try:
-            await bot.send_message(
-                target,
-                "🎉 У тебя взаимная симпатия в VibeMatch!",
-                reply_markup=other_kb,
             )
-        except Exception:
-            pass
+        ]
+    ])
 
-        await callback.answer("Взаимная симпатия! 💜")
-    else:
-        await callback.answer("Лайк отправлен 💜")
+    await callback.message.answer(
+        "🎉 Взаимная симпатия!\n"
+        "Вы оба хотите познакомиться. 💜\n\n"
+        "Нажми кнопку, чтобы открыть чат.",
+        reply_markup=kb_for_me,
+    )
+
+    try:
+        await bot.send_message(
+            target,
+            "🎉 У тебя взаимная симпатия в VibeMatch!",
+            reply_markup=kb_for_other,
+        )
+    except Exception:
+        pass
+
+    await callback.answer("Взаимная симпатия! 💜")
 
 
-# -------------------- СПИСОК ЧАТОВ --------------------
+# ==================================================
+# CHATS LIST
+# ==================================================
 
 async def show_chats(message: Message, uid: int):
     rows = await db.fetch("""
@@ -524,23 +699,30 @@ async def show_chats(message: Message, uid: int):
         )
         return
 
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"💬 {row['name']}",
-            callback_data=f"openchat:{row['user_id']}",
-        )]
-        for row in rows
-    ]
+    buttons = []
+
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"💬 {row['name']}",
+                callback_data=f"openchat:{row['user_id']}",
+            )
+        ])
 
     await message.answer(
-        "💬 Твои чаты. Выбери собеседника:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        "💬 Выбери собеседника:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
     )
 
 
 @dp.callback_query(F.data == "chats")
 async def chats_callback(callback: CallbackQuery):
-    await show_chats(callback.message, callback.from_user.id)
+    await show_chats(
+        callback.message,
+        callback.from_user.id,
+    )
     await callback.answer()
 
 
@@ -549,7 +731,9 @@ async def chats_command(message: Message):
     await show_chats(message, message.from_user.id)
 
 
-# -------------------- ОТКРЫТИЕ ЧАТА --------------------
+# ==================================================
+# OPEN CHAT
+# ==================================================
 
 @dp.callback_query(F.data.startswith("openchat:"))
 async def open_chat(callback: CallbackQuery):
@@ -558,20 +742,33 @@ async def open_chat(callback: CallbackQuery):
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer("Некорректный чат.", show_alert=True)
+        await callback.answer(
+            "Некорректный чат.",
+            show_alert=True,
+        )
         return
 
     if uid == target or not await has_match(uid, target):
-        await callback.answer("Взаимная симпатия не найдена.", show_alert=True)
+        await callback.answer(
+            "Взаимная симпатия не найдена.",
+            show_alert=True,
+        )
         return
 
     if await is_blocked(uid, target):
-        await callback.answer("Этот чат недоступен.", show_alert=True)
+        await callback.answer(
+            "Этот чат недоступен.",
+            show_alert=True,
+        )
         return
 
     other = await get_profile(target)
+
     if not other:
-        await callback.answer("Анкета удалена.", show_alert=True)
+        await callback.answer(
+            "Анкета удалена.",
+            show_alert=True,
+        )
         return
 
     await db.execute("""
@@ -591,30 +788,33 @@ async def open_chat(callback: CallbackQuery):
     if reciprocal:
         await callback.message.answer(
             f"💬 Чат с {other['name']} открыт!\n\n"
-            "Отправляй текстовые сообщения, фото, видео или голосовые.\n"
-            "Команда /stopchat завершает текущий чат."
+            "Отправляй текст, фото, видео или голосовые.\n"
+            "Чтобы завершить переписку, напиши /stopchat."
         )
 
+        my_profile = await get_profile(uid)
+
         try:
-            my_profile = await get_profile(uid)
             await bot.send_message(
                 target,
                 f"💬 {my_profile['name']} тоже открыл чат!\n"
                 "Теперь вы можете переписываться.\n"
-                "Команда /stopchat завершает чат.",
+                "Чтобы завершить переписку, напиши /stopchat.",
             )
         except Exception:
             pass
     else:
         await callback.message.answer(
             f"Ты выбрал(а) чат с {other['name']}.\n"
-            "Ожидаем, пока собеседник тоже откроет чат. 💜"
+            "Ожидаем, пока собеседник тоже откроет этот чат. 💜"
         )
+
+        my_profile = await get_profile(uid)
 
         try:
             await bot.send_message(
                 target,
-                f"💬 {callback.from_user.full_name} хочет открыть чат.\n"
+                f"💬 {my_profile['name']} хочет открыть чат.\n"
                 "Зайди в «Мои чаты» и выбери этого собеседника.",
             )
         except Exception:
@@ -623,12 +823,13 @@ async def open_chat(callback: CallbackQuery):
     await callback.answer()
 
 
-# -------------------- ЗАВЕРШЕНИЕ ЧАТА --------------------
+# ==================================================
+# STOP CHAT
+# ==================================================
 
 @dp.message(Command("stopchat"))
 async def stop_chat(message: Message):
-    uid = message.from_user.id
-    partner = await close_chat_sessions(uid)
+    partner = await close_chat_sessions(message.from_user.id)
 
     if partner is None:
         await message.answer("У тебя нет активного чата.")
@@ -639,27 +840,35 @@ async def stop_chat(message: Message):
     try:
         await bot.send_message(
             partner,
-            "Собеседник завершил чат. Чтобы переписываться снова, "
-            "откройте чат через «Мои чаты».",
+            "Собеседник завершил чат.\n"
+            "Чтобы переписываться снова, откройте чат через «Мои чаты».",
         )
     except Exception:
         pass
 
 
-# -------------------- БЛОКИРОВКИ И ЖАЛОБЫ --------------------
+# ==================================================
+# BLOCK AND REPORT
+# ==================================================
 
 @dp.callback_query(F.data.startswith("block:"))
 async def block_profile(callback: CallbackQuery):
+    uid = callback.from_user.id
+
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer("Некорректная анкета.", show_alert=True)
+        await callback.answer(
+            "Некорректная анкета.",
+            show_alert=True,
+        )
         return
 
-    uid = callback.from_user.id
-
     if uid == target:
-        await callback.answer("Нельзя заблокировать себя.", show_alert=True)
+        await callback.answer(
+            "Нельзя заблокировать себя.",
+            show_alert=True,
+        )
         return
 
     await db.execute("""
@@ -685,16 +894,22 @@ async def block_profile(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("report:"))
 async def report_profile(callback: CallbackQuery):
+    uid = callback.from_user.id
+
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer("Некорректная анкета.", show_alert=True)
+        await callback.answer(
+            "Некорректная анкета.",
+            show_alert=True,
+        )
         return
 
-    uid = callback.from_user.id
-
     if uid == target:
-        await callback.answer("Нельзя пожаловаться на себя.", show_alert=True)
+        await callback.answer(
+            "Нельзя пожаловаться на себя.",
+            show_alert=True,
+        )
         return
 
     await db.execute("""
@@ -703,13 +918,16 @@ async def report_profile(callback: CallbackQuery):
     """, uid, target, "Жалоба из карточки анкеты")
 
     await callback.message.answer(
-        "⚠️ Жалоба записана. Для полноценной модерации "
-        "понадобится отдельная панель администратора."
+        "⚠️ Жалоба записана.\n"
+        "Если пользователь нарушает правила, не продолжай общение."
     )
+
     await callback.answer("Жалоба отправлена")
 
 
-# -------------------- УДАЛЕНИЕ АНКЕТЫ --------------------
+# ==================================================
+# DELETE PROFILE
+# ==================================================
 
 @dp.message(Command("delete"))
 async def delete_profile(message: Message, state: FSMContext):
@@ -721,19 +939,24 @@ async def delete_profile(message: Message, state: FSMContext):
     async with db.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
-                "DELETE FROM profiles WHERE user_id = $1", uid
+                "DELETE FROM profiles WHERE user_id = $1",
+                uid,
             )
             await conn.execute(
-                "DELETE FROM likes WHERE from_id = $1 OR to_id = $1", uid
+                "DELETE FROM likes WHERE from_id = $1 OR to_id = $1",
+                uid,
             )
             await conn.execute(
-                "DELETE FROM matches WHERE user1 = $1 OR user2 = $1", uid
+                "DELETE FROM matches WHERE user1 = $1 OR user2 = $1",
+                uid,
             )
             await conn.execute(
-                "DELETE FROM blocks WHERE from_id = $1 OR to_id = $1", uid
+                "DELETE FROM blocks WHERE from_id = $1 OR to_id = $1",
+                uid,
             )
             await conn.execute(
-                "DELETE FROM reports WHERE reporter = $1 OR reported = $1", uid
+                "DELETE FROM reports WHERE reporter = $1 OR reported = $1",
+                uid,
             )
             await conn.execute(
                 "DELETE FROM chat_sessions WHERE user_id = $1 OR partner_id = $1",
@@ -751,14 +974,139 @@ async def delete_profile(message: Message, state: FSMContext):
 
     await message.answer(
         "✅ Анкета и связанные данные удалены.\n"
-        "Напиши /start, чтобы начать заново."
+        "Напиши /start, чтобы создать новую."
     )
 
 
-# -------------------- ПЕРЕСЫЛКА СООБЩЕНИЙ --------------------
+# ==================================================
+# SUPPORT WITH TELEGRAM STARS
+# ==================================================
+
+@dp.callback_query(F.data == "support")
+async def support_menu(callback: CallbackQuery):
+    await callback.message.answer(
+        "❤️ Поддержка VibeMatch\n\n"
+        "Если тебе нравится проект, можешь добровольно "
+        "поддержать его развитие с помощью Telegram Stars.\n\n"
+        "Выбери сумму ниже ⭐\n\n"
+        "Поддержка добровольная и не даёт преимуществ "
+        "в поиске анкет или переписке.",
+        reply_markup=support_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_(SUPPORT_AMOUNTS.keys()))
+async def create_support_invoice(callback: CallbackQuery):
+    amount = SUPPORT_AMOUNTS[callback.data]
+
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title="Поддержка VibeMatch ❤️",
+            description=(
+                f"Добровольная поддержка развития VibeMatch — "
+                f"{amount} Telegram Stars."
+            ),
+            payload=f"vibematch_support_{amount}",
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label=f"Поддержка VibeMatch — {amount} Stars",
+                    amount=amount,
+                )
+            ],
+            provider_token="",
+        )
+
+        await callback.answer()
+    except Exception:
+        await callback.answer(
+            "Не удалось создать счёт. Попробуй позже.",
+            show_alert=True,
+        )
+        raise
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: PreCheckoutQuery):
+    payload = query.invoice_payload
+
+    valid_amount = None
+
+    for amount in SUPPORT_AMOUNTS.values():
+        if payload == f"vibematch_support_{amount}":
+            valid_amount = amount
+            break
+
+    if valid_amount is None or query.currency != "XTR":
+        await query.answer(
+            ok=False,
+            error_message="Некорректный счёт поддержки.",
+        )
+        return
+
+    if query.total_amount != valid_amount:
+        await query.answer(
+            ok=False,
+            error_message="Сумма платежа не совпадает.",
+        )
+        return
+
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def support_success(message: Message):
+    payment = message.successful_payment
+
+    if not payment.invoice_payload.startswith("vibematch_support_"):
+        return
+
+    if payment.currency != "XTR":
+        return
+
+    amount = payment.total_amount
+
+    # Telegram charge ID уникален: повторная обработка
+    # не создаст вторую запись о том же платеже.
+    inserted = await db.fetchval("""
+        INSERT INTO donations
+            (user_id, amount, currency, telegram_charge_id)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (telegram_charge_id) DO NOTHING
+        RETURNING id
+    """,
+        message.from_user.id,
+        amount,
+        payment.currency,
+        payment.telegram_payment_charge_id,
+    )
+
+    if inserted is not None:
+        print(
+            "VibeMatch donation received: "
+            f"user_id={message.from_user.id}, "
+            f"amount={amount} XTR, donation_id={inserted}"
+        )
+
+    await message.answer(
+        f"❤️ Спасибо за поддержку VibeMatch!\n\n"
+        f"Твой платёж: {amount} ⭐\n"
+        "Спасибо, что помогаешь проекту развиваться!"
+    )
+
+
+# ==================================================
+# RELAY MESSAGES — KEEP THIS HANDLER LAST
+# ==================================================
 
 @dp.message()
 async def relay_message(message: Message):
+    if message.from_user is None:
+        return
+
     uid = message.from_user.id
 
     session = await db.fetchrow("""
@@ -781,8 +1129,7 @@ async def relay_message(message: Message):
 
     if not reciprocal:
         await message.answer(
-            "⏳ Собеседник ещё не открыл чат. "
-            "Когда он подключится, переписка начнётся."
+            "⏳ Собеседник ещё не открыл чат."
         )
         return
 
@@ -792,8 +1139,13 @@ async def relay_message(message: Message):
         return
 
     profile = await get_profile(uid)
+
     if not profile:
         await close_chat_sessions(uid)
+        return
+
+    # Не пересылаем команды как обычные сообщения.
+    if message.text and message.text.startswith("/"):
         return
 
     try:
@@ -812,27 +1164,34 @@ async def relay_message(message: Message):
                 from_chat_id=uid,
                 message_id=message.message_id,
             )
+
     except Exception:
         await message.answer(
-            "Не удалось отправить сообщение. "
-            "Возможно, собеседник заблокировал бота."
+            "Не удалось отправить сообщение. Попробуй позже."
         )
 
 
-# -------------------- ЗАПУСК --------------------
+# ==================================================
+# RUN
+# ==================================================
 
 async def main():
     global bot, db
 
     if not TOKEN:
-        raise RuntimeError("Не задана переменная BOT_TOKEN")
+        raise RuntimeError(
+            "Не задана переменная окружения BOT_TOKEN"
+        )
 
     if not DATABASE_URL:
-        raise RuntimeError("Не задана переменная DATABASE_URL")
+        raise RuntimeError(
+            "Не задана переменная окружения DATABASE_URL"
+        )
 
-    # Передаём asyncpg URL без параметров sslmode/channel_binding:
-    # TLS включаем отдельно через ssl="require".
+    # Убираем параметры URL, которые asyncpg может не поддерживать.
+    # TLS для соединения с Neon задаём отдельно.
     parsed = urlsplit(DATABASE_URL)
+
     clean_url = urlunsplit((
         parsed.scheme,
         parsed.netloc,
@@ -853,7 +1212,7 @@ async def main():
     bot = Bot(token=TOKEN)
 
     try:
-        print("VibeMatch подключён к PostgreSQL. Запускаю бота...")
+        print("VibeMatch подключён к PostgreSQL.")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
