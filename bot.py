@@ -1,7 +1,9 @@
 
 import os
 import asyncio
-import aiosqlite
+from urllib.parse import urlsplit, urlunsplit
+
+import asyncpg
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -16,9 +18,10 @@ from aiogram.types import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "vibematch.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = None
+db = None
 dp = Dispatcher(storage=MemoryStorage())
 
 
@@ -29,6 +32,9 @@ class ProfileForm(StatesGroup):
     age_group = State()
     interests = State()
     bio = State()
+
+
+AGE_GROUPS = {"13-15", "16-17", "18+"}
 
 
 def menu():
@@ -42,128 +48,130 @@ def menu():
         [InlineKeyboardButton(
             text="👤 Моя анкета", callback_data="myprofile"
         )],
-        [InlineKeyboardButton(
-            text="👁 Скрыть анкету", callback_data="hide"
-        )],
-        [InlineKeyboardButton(
-            text="🌟 Показывать анкету", callback_data="show"
-        )],
+        [
+            InlineKeyboardButton(
+                text="👁 Скрыть анкету", callback_data="hide"
+            ),
+            InlineKeyboardButton(
+                text="🌟 Показывать анкету", callback_data="show"
+            ),
+        ],
     ])
 
 
-def chat_button(partner_id):
+def age_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="💬 Открыть чат",
-            callback_data=f"chatwith:{partner_id}",
-        )]
+        [InlineKeyboardButton(text="13–15", callback_data="age:13-15")],
+        [InlineKeyboardButton(text="16–17", callback_data="age:16-17")],
+        [InlineKeyboardButton(text="18+", callback_data="age:18+")],
     ])
 
 
-# -------------------- БАЗА ДАННЫХ --------------------
+# -------------------- POSTGRESQL --------------------
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                age_group TEXT NOT NULL,
-                interests TEXT NOT NULL,
-                bio TEXT NOT NULL DEFAULT '',
-                visible INTEGER NOT NULL DEFAULT 1
-            )
-        """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id BIGINT PRIMARY KEY,
+            name TEXT NOT NULL,
+            age_group TEXT NOT NULL,
+            interests TEXT NOT NULL,
+            bio TEXT NOT NULL DEFAULT '',
+            visible BOOLEAN NOT NULL DEFAULT TRUE
+        )
+    """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS likes (
-                from_id INTEGER NOT NULL,
-                to_id INTEGER NOT NULL,
-                UNIQUE(from_id, to_id)
-            )
-        """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS likes (
+            from_id BIGINT NOT NULL,
+            to_id BIGINT NOT NULL,
+            UNIQUE(from_id, to_id)
+        )
+    """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS matches (
-                user1 INTEGER NOT NULL,
-                user2 INTEGER NOT NULL,
-                UNIQUE(user1, user2)
-            )
-        """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            user1 BIGINT NOT NULL,
+            user2 BIGINT NOT NULL,
+            UNIQUE(user1, user2)
+        )
+    """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS blocks (
-                from_id INTEGER NOT NULL,
-                to_id INTEGER NOT NULL,
-                UNIQUE(from_id, to_id)
-            )
-        """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS blocks (
+            from_id BIGINT NOT NULL,
+            to_id BIGINT NOT NULL,
+            UNIQUE(from_id, to_id)
+        )
+    """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS reports (
-                reporter INTEGER NOT NULL,
-                reported INTEGER NOT NULL,
-                reason TEXT NOT NULL DEFAULT 'Не указана'
-            )
-        """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id BIGSERIAL PRIMARY KEY,
+            reporter BIGINT NOT NULL,
+            reported BIGINT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'Не указана',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                user_id INTEGER PRIMARY KEY,
-                partner_id INTEGER NOT NULL
-            )
-        """)
-
-        await db.commit()
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            user_id BIGINT PRIMARY KEY,
+            partner_id BIGINT NOT NULL
+        )
+    """)
 
 
 async def get_profile(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM profiles WHERE user_id = ?",
-            (user_id,),
-        )
-        return await cur.fetchone()
+    return await db.fetchrow(
+        "SELECT * FROM profiles WHERE user_id = $1",
+        user_id,
+    )
 
 
-async def is_blocked(uid, target):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
+async def is_blocked(user1, user2):
+    result = await db.fetchval("""
+        SELECT EXISTS(
             SELECT 1 FROM blocks
-            WHERE (from_id = ? AND to_id = ?)
-               OR (from_id = ? AND to_id = ?)
-        """, (uid, target, target, uid))
-        return await cur.fetchone() is not None
+            WHERE (from_id = $1 AND to_id = $2)
+               OR (from_id = $2 AND to_id = $1)
+        )
+    """, user1, user2)
+    return result
 
 
-async def has_match(uid, target):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
+async def has_match(user1, user2):
+    a, b = sorted((user1, user2))
+    return await db.fetchval("""
+        SELECT EXISTS(
             SELECT 1 FROM matches
-            WHERE (user1 = ? AND user2 = ?)
-               OR (user1 = ? AND user2 = ?)
-        """, (uid, target, target, uid))
-        return await cur.fetchone() is not None
+            WHERE user1 = $1 AND user2 = $2
+        )
+    """, a, b)
 
 
-async def close_chat_sessions(uid, target=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if target is None:
-            await db.execute("""
-                DELETE FROM chat_sessions
-                WHERE user_id = ? OR partner_id = ?
-            """, (uid, uid))
-        else:
-            await db.execute("""
-                DELETE FROM chat_sessions
-                WHERE (user_id = ? AND partner_id = ?)
-                   OR (user_id = ? AND partner_id = ?)
-            """, (uid, target, target, uid))
-        await db.commit()
+async def close_chat_sessions(user_id):
+    partner = await db.fetchval(
+        "SELECT partner_id FROM chat_sessions WHERE user_id = $1",
+        user_id,
+    )
+
+    await db.execute(
+        "DELETE FROM chat_sessions WHERE user_id = $1",
+        user_id,
+    )
+
+    if partner is not None:
+        await db.execute(
+            "DELETE FROM chat_sessions WHERE user_id = $1",
+            partner,
+        )
+
+    return partner
 
 
-# -------------------- СТАРТ И АНКЕТА --------------------
+# -------------------- СТАРТ --------------------
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
@@ -173,7 +181,8 @@ async def start(message: Message, state: FSMContext):
 
     if profile:
         await message.answer(
-            f"С возвращением в VibeMatch, {profile['name']}! 💜",
+            f"💜 С возвращением, {profile['name']}!\n\n"
+            "Добро пожаловать в VibeMatch.",
             reply_markup=menu(),
         )
         return
@@ -198,23 +207,10 @@ async def form_name(message: Message, state: FSMContext):
         return
 
     await state.update_data(name=name)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="13–15", callback_data="age:13-15"
-        )],
-        [InlineKeyboardButton(
-            text="16–17", callback_data="age:16-17"
-        )],
-        [InlineKeyboardButton(
-            text="18+", callback_data="age:18+"
-        )],
-    ])
-
     await message.answer(
         "Выбери свою возрастную группу. "
-        "Анкеты будут показываться только внутри этой группы.",
-        reply_markup=kb,
+        "Анкеты показываются только внутри той же группы.",
+        reply_markup=age_keyboard(),
     )
     await state.set_state(ProfileForm.age_group)
 
@@ -223,11 +219,13 @@ async def form_name(message: Message, state: FSMContext):
 async def form_age(callback: CallbackQuery, state: FSMContext):
     age_group = callback.data.split(":", 1)[1]
 
+    if age_group not in AGE_GROUPS:
+        await callback.answer("Неверная возрастная группа.", show_alert=True)
+        return
+
     await state.update_data(age_group=age_group)
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        "Напиши свои интересы через запятую."
-    )
+    await callback.message.answer("Напиши свои интересы через запятую.")
     await state.set_state(ProfileForm.interests)
     await callback.answer()
 
@@ -238,7 +236,7 @@ async def form_interests(message: Message, state: FSMContext):
 
     if not 2 <= len(interests) <= 200:
         await message.answer(
-            "Укажи интересы длиной от 2 до 200 символов."
+            "Интересы должны содержать от 2 до 200 символов."
         )
         return
 
@@ -262,29 +260,27 @@ async def form_bio(message: Message, state: FSMContext):
 
     data = await state.get_data()
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO profiles
-                (user_id, name, age_group, interests, bio, visible)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(user_id) DO UPDATE SET
-                name = excluded.name,
-                age_group = excluded.age_group,
-                interests = excluded.interests,
-                bio = excluded.bio,
-                visible = 1
-        """, (
-            message.from_user.id,
-            data["name"],
-            data["age_group"],
-            data["interests"],
-            bio,
-        ))
-        await db.commit()
+    await db.execute("""
+        INSERT INTO profiles
+            (user_id, name, age_group, interests, bio, visible)
+        VALUES ($1, $2, $3, $4, $5, TRUE)
+        ON CONFLICT (user_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            age_group = EXCLUDED.age_group,
+            interests = EXCLUDED.interests,
+            bio = EXCLUDED.bio,
+            visible = TRUE
+    """,
+        message.from_user.id,
+        data["name"],
+        data["age_group"],
+        data["interests"],
+        bio,
+    )
 
     await state.clear()
     await message.answer(
-        "✅ Анкета сохранена!",
+        "✅ Анкета сохранена в PostgreSQL!",
         reply_markup=menu(),
     )
 
@@ -296,16 +292,15 @@ async def myprofile(callback: CallbackQuery):
     p = await get_profile(callback.from_user.id)
 
     if not p:
-        await callback.message.answer(
-            "Сначала создай анкету командой /start."
-        )
+        await callback.message.answer("Сначала создай анкету: /start")
     else:
+        status = "видна" if p["visible"] else "скрыта"
         await callback.message.answer(
             f"👤 {p['name']}\n"
             f"Возрастная группа: {p['age_group']}\n"
             f"Интересы: {p['interests']}\n"
             f"О себе: {p['bio'] or 'Не указано'}\n"
-            f"Статус: {'видна' if p['visible'] else 'скрыта'}",
+            f"Статус: {status}",
             reply_markup=menu(),
         )
 
@@ -314,13 +309,10 @@ async def myprofile(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "hide")
 async def hide_profile(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE profiles SET visible = 0 WHERE user_id = ?",
-            (callback.from_user.id,),
-        )
-        await db.commit()
-
+    await db.execute(
+        "UPDATE profiles SET visible = FALSE WHERE user_id = $1",
+        callback.from_user.id,
+    )
     await callback.message.answer(
         "👁 Анкета скрыта.",
         reply_markup=menu(),
@@ -330,13 +322,16 @@ async def hide_profile(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "show")
 async def show_profile(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE profiles SET visible = 1 WHERE user_id = ?",
-            (callback.from_user.id,),
-        )
-        await db.commit()
+    profile = await get_profile(callback.from_user.id)
 
+    if not profile:
+        await callback.answer("Сначала создай анкету через /start", show_alert=True)
+        return
+
+    await db.execute(
+        "UPDATE profiles SET visible = TRUE WHERE user_id = $1",
+        callback.from_user.id,
+    )
     await callback.message.answer(
         "💜 Анкета снова видна.",
         reply_markup=menu(),
@@ -352,36 +347,28 @@ async def browse(callback: CallbackQuery):
     me = await get_profile(uid)
 
     if not me:
-        await callback.message.answer(
-            "Сначала создай анкету: /start"
-        )
+        await callback.message.answer("Сначала создай анкету: /start")
         await callback.answer()
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        cur = await db.execute("""
-            SELECT p.* FROM profiles p
-            WHERE p.visible = 1
-              AND p.user_id != ?
-              AND p.age_group = ?
-              AND p.user_id NOT IN (
-                  SELECT to_id FROM blocks WHERE from_id = ?
-              )
-              AND p.user_id NOT IN (
-                  SELECT from_id FROM blocks WHERE to_id = ?
-              )
-              AND p.user_id NOT IN (
-                  SELECT to_id FROM likes WHERE from_id = ?
-              )
-            ORDER BY RANDOM()
-            LIMIT 1
-        """, (
-            uid, me["age_group"], uid, uid, uid
-        ))
-
-        p = await cur.fetchone()
+    p = await db.fetchrow("""
+        SELECT p.*
+        FROM profiles p
+        WHERE p.visible = TRUE
+          AND p.user_id != $1
+          AND p.age_group = $2
+          AND NOT EXISTS (
+              SELECT 1 FROM blocks b
+              WHERE (b.from_id = $1 AND b.to_id = p.user_id)
+                 OR (b.from_id = p.user_id AND b.to_id = $1)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM likes l
+              WHERE l.from_id = $1 AND l.to_id = p.user_id
+          )
+        ORDER BY RANDOM()
+        LIMIT 1
+    """, uid, me["age_group"])
 
     if not p:
         await callback.message.answer(
@@ -422,139 +409,139 @@ async def browse(callback: CallbackQuery):
     await callback.answer()
 
 
-# -------------------- ЛАЙКИ И СОВПАДЕНИЯ --------------------
+# -------------------- ЛАЙКИ И ВЗАИМНОСТЬ --------------------
 
 @dp.callback_query(F.data.startswith("like:"))
 async def like_profile(callback: CallbackQuery):
     uid = callback.from_user.id
-    target = int(callback.data.split(":", 1)[1])
+
+    try:
+        target = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная анкета.", show_alert=True)
+        return
 
     if uid == target:
-        await callback.answer(
-            "Это твоя анкета.",
-            show_alert=True,
-        )
+        await callback.answer("Это твоя анкета.", show_alert=True)
         return
 
     me = await get_profile(uid)
     other = await get_profile(target)
 
     if not me or not other or not other["visible"]:
-        await callback.answer(
-            "Анкета больше недоступна.",
-            show_alert=True,
-        )
+        await callback.answer("Анкета больше недоступна.", show_alert=True)
         return
 
     if me["age_group"] != other["age_group"]:
-        await callback.answer(
-            "Возрастные группы не совпадают.",
-            show_alert=True,
-        )
+        await callback.answer("Возрастные группы не совпадают.", show_alert=True)
         return
 
     if await is_blocked(uid, target):
-        await callback.answer(
-            "Взаимодействие недоступно.",
-            show_alert=True,
-        )
+        await callback.answer("Взаимодействие недоступно.", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO likes VALUES (?, ?)",
-            (uid, target),
+    await db.execute("""
+        INSERT INTO likes (from_id, to_id)
+        VALUES ($1, $2)
+        ON CONFLICT DO NOTHING
+    """, uid, target)
+
+    mutual = await db.fetchval("""
+        SELECT EXISTS(
+            SELECT 1 FROM likes
+            WHERE from_id = $1 AND to_id = $2
         )
-
-        cur = await db.execute(
-            "SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?",
-            (target, uid),
-        )
-        mutual = await cur.fetchone() is not None
-
-        if mutual:
-            a, b = sorted((uid, target))
-            await db.execute(
-                "INSERT OR IGNORE INTO matches VALUES (?, ?)",
-                (a, b),
-            )
-
-        await db.commit()
+    """, target, uid)
 
     if mutual:
+        a, b = sorted((uid, target))
+
+        await db.execute("""
+            INSERT INTO matches (user1, user2)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """, a, b)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💬 Открыть чат",
+                callback_data=f"openchat:{target}",
+            )]
+        ])
+
         await callback.message.answer(
-            "🎉 Взаимная симпатия!\n\n"
-            "Вы оба заинтересованы в знакомстве. "
-            "Нажми кнопку ниже, чтобы предложить начать общение.",
-            reply_markup=chat_button(target),
+            "🎉 Взаимная симпатия! Вы оба хотите познакомиться.\n"
+            "Чтобы начать переписку, открой чат.",
+            reply_markup=kb,
         )
+
+        other_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💬 Открыть чат",
+                callback_data=f"openchat:{uid}",
+            )]
+        ])
 
         try:
             await bot.send_message(
                 target,
-                "🎉 У тебя взаимная симпатия в VibeMatch!\n"
-                "Открой чат, если хочешь начать общение.",
-                reply_markup=chat_button(uid),
+                "🎉 У тебя взаимная симпатия в VibeMatch!",
+                reply_markup=other_kb,
             )
         except Exception:
             pass
 
+        await callback.answer("Взаимная симпатия! 💜")
     else:
         await callback.answer("Лайк отправлен 💜")
 
-    await callback.answer()
 
-
-# -------------------- МОИ ЧАТЫ --------------------
-
-async def get_user_chats(uid):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        cur = await db.execute("""
-            SELECT p.user_id, p.name
-            FROM matches m
-            JOIN profiles p
-              ON p.user_id = CASE
-                  WHEN m.user1 = ? THEN m.user2
-                  ELSE m.user1
-              END
-            WHERE (m.user1 = ? OR m.user2 = ?)
-              AND NOT EXISTS (
-                  SELECT 1 FROM blocks b
-                  WHERE (b.from_id = ? AND b.to_id = p.user_id)
-                     OR (b.from_id = p.user_id AND b.to_id = ?)
-              )
-            ORDER BY p.name
-        """, (uid, uid, uid, uid, uid))
-
-        return await cur.fetchall()
-
-
-def chats_keyboard(rows):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"💬 {row['name'][:40]}",
-            callback_data=f"chatwith:{row['user_id']}",
-        )]
-        for row in rows
-    ])
-
+# -------------------- СПИСОК ЧАТОВ --------------------
 
 async def show_chats(message: Message, uid: int):
-    rows = await get_user_chats(uid)
+    rows = await db.fetch("""
+        SELECT p.user_id, p.name
+        FROM matches m
+        JOIN profiles p
+          ON p.user_id = CASE
+              WHEN m.user1 = $1 THEN m.user2
+              ELSE m.user1
+          END
+        WHERE (m.user1 = $1 OR m.user2 = $1)
+          AND NOT EXISTS (
+              SELECT 1 FROM blocks b
+              WHERE (b.from_id = $1 AND b.to_id = p.user_id)
+                 OR (b.from_id = p.user_id AND b.to_id = $1)
+          )
+        ORDER BY p.name
+    """, uid)
 
     if not rows:
         await message.answer(
-            "Пока нет совпадений. Найди собеседника "
-            "и дождись взаимного лайка 💜"
+            "Пока нет взаимных симпатий.\n"
+            "Найди собеседника через меню 💜",
+            reply_markup=menu(),
         )
         return
 
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"💬 {row['name']}",
+            callback_data=f"openchat:{row['user_id']}",
+        )]
+        for row in rows
+    ]
+
     await message.answer(
-        "💬 Твои совпадения — выбери собеседника:",
-        reply_markup=chats_keyboard(rows),
+        "💬 Твои чаты. Выбери собеседника:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+@dp.callback_query(F.data == "chats")
+async def chats_callback(callback: CallbackQuery):
+    await show_chats(callback.message, callback.from_user.id)
+    await callback.answer()
 
 
 @dp.message(Command("chats"))
@@ -562,15 +549,9 @@ async def chats_command(message: Message):
     await show_chats(message, message.from_user.id)
 
 
-@dp.callback_query(F.data == "chats")
-async def chats_button(callback: CallbackQuery):
-    await show_chats(callback.message, callback.from_user.id)
-    await callback.answer()
-
-
 # -------------------- ОТКРЫТИЕ ЧАТА --------------------
 
-@dp.callback_query(F.data.startswith("chatwith:"))
+@dp.callback_query(F.data.startswith("openchat:"))
 async def open_chat(callback: CallbackQuery):
     uid = callback.from_user.id
 
@@ -580,86 +561,66 @@ async def open_chat(callback: CallbackQuery):
         await callback.answer("Некорректный чат.", show_alert=True)
         return
 
-    if uid == target:
-        await callback.answer(
-            "Нельзя открыть чат с собой.",
-            show_alert=True,
-        )
+    if uid == target or not await has_match(uid, target):
+        await callback.answer("Взаимная симпатия не найдена.", show_alert=True)
         return
 
-    me = await get_profile(uid)
+    if await is_blocked(uid, target):
+        await callback.answer("Этот чат недоступен.", show_alert=True)
+        return
+
     other = await get_profile(target)
-
-    if not me or not other:
-        await callback.answer(
-            "Анкета недоступна.",
-            show_alert=True,
-        )
+    if not other:
+        await callback.answer("Анкета удалена.", show_alert=True)
         return
 
-    if me["age_group"] != other["age_group"]:
-        await callback.answer(
-            "Возрастные группы не совпадают.",
-            show_alert=True,
+    await db.execute("""
+        INSERT INTO chat_sessions (user_id, partner_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE
+        SET partner_id = EXCLUDED.partner_id
+    """, uid, target)
+
+    reciprocal = await db.fetchval("""
+        SELECT EXISTS(
+            SELECT 1 FROM chat_sessions
+            WHERE user_id = $1 AND partner_id = $2
         )
-        return
+    """, target, uid)
 
-    if not await has_match(uid, target) or await is_blocked(uid, target):
-        await callback.answer(
-            "Чат недоступен.",
-            show_alert=True,
-        )
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO chat_sessions (user_id, partner_id)
-            VALUES (?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET partner_id = excluded.partner_id
-        """, (uid, target))
-
-        cur = await db.execute(
-            "SELECT partner_id FROM chat_sessions WHERE user_id = ?",
-            (target,),
-        )
-        target_session = await cur.fetchone()
-        await db.commit()
-
-    await callback.answer()
-
-    if target_session and target_session[0] == uid:
+    if reciprocal:
         await callback.message.answer(
-            f"💜 Чат с {other['name']} открыт!\n\n"
-            "Отправляй сообщения прямо сюда.\n"
-            "Завершить общение: /stopchat"
+            f"💬 Чат с {other['name']} открыт!\n\n"
+            "Отправляй текстовые сообщения, фото, видео или голосовые.\n"
+            "Команда /stopchat завершает текущий чат."
         )
 
         try:
+            my_profile = await get_profile(uid)
             await bot.send_message(
                 target,
-                f"💜 Чат с {me['name']} открыт!\n\n"
-                "Отправляй сообщения прямо сюда.\n"
-                "Завершить общение: /stopchat",
+                f"💬 {my_profile['name']} тоже открыл чат!\n"
+                "Теперь вы можете переписываться.\n"
+                "Команда /stopchat завершает чат.",
             )
         except Exception:
             pass
     else:
         await callback.message.answer(
-            f"💌 Запрос на общение с {other['name']} отправлен.\n"
-            "Чат заработает, когда собеседник тоже его откроет."
+            f"Ты выбрал(а) чат с {other['name']}.\n"
+            "Ожидаем, пока собеседник тоже откроет чат. 💜"
         )
 
         try:
             await bot.send_message(
                 target,
-                f"💜 {me['name']} хочет начать общение в VibeMatch.",
-                reply_markup=chat_button(uid),
+                f"💬 {callback.from_user.full_name} хочет открыть чат.\n"
+                "Зайди в «Мои чаты» и выбери этого собеседника.",
             )
         except Exception:
-            await callback.message.answer(
-                "Не удалось уведомить собеседника. Попробуй позже."
-            )
+            pass
+
+    await callback.answer()
 
 
 # -------------------- ЗАВЕРШЕНИЕ ЧАТА --------------------
@@ -667,93 +628,85 @@ async def open_chat(callback: CallbackQuery):
 @dp.message(Command("stopchat"))
 async def stop_chat(message: Message):
     uid = message.from_user.id
+    partner = await close_chat_sessions(uid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT partner_id FROM chat_sessions WHERE user_id = ?",
-            (uid,),
-        )
-        row = await cur.fetchone()
-
-    if not row:
+    if partner is None:
         await message.answer("У тебя нет активного чата.")
         return
 
-    target = row[0]
-    await close_chat_sessions(uid, target)
-
-    await message.answer(
-        "🛑 Чат завершён.\n"
-        "Чтобы начать общение снова, открой «Мои чаты»."
-    )
+    await message.answer("Чат завершён. 💜")
 
     try:
         await bot.send_message(
-            target,
-            "🛑 Собеседник завершил чат. "
-            "Чтобы общаться снова, открой «Мои чаты»."
+            partner,
+            "Собеседник завершил чат. Чтобы переписываться снова, "
+            "откройте чат через «Мои чаты».",
         )
     except Exception:
         pass
 
 
-# -------------------- БЛОКИРОВКА И ЖАЛОБЫ --------------------
+# -------------------- БЛОКИРОВКИ И ЖАЛОБЫ --------------------
 
 @dp.callback_query(F.data.startswith("block:"))
 async def block_profile(callback: CallbackQuery):
-    uid = callback.from_user.id
-
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer("Некорректный пользователь.")
+        await callback.answer("Некорректная анкета.", show_alert=True)
         return
+
+    uid = callback.from_user.id
 
     if uid == target:
-        await callback.answer()
+        await callback.answer("Нельзя заблокировать себя.", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO blocks VALUES (?, ?)",
-            (uid, target),
-        )
-        await db.commit()
+    await db.execute("""
+        INSERT INTO blocks (from_id, to_id)
+        VALUES ($1, $2)
+        ON CONFLICT DO NOTHING
+    """, uid, target)
 
-    await close_chat_sessions(uid, target)
+    partner = await close_chat_sessions(uid)
 
-    await callback.message.answer(
-        "🚫 Пользователь заблокирован. Общение закрыто."
-    )
+    await callback.message.answer("🚫 Пользователь заблокирован.")
     await callback.answer()
+
+    if partner == target:
+        try:
+            await bot.send_message(
+                target,
+                "Переписка завершена, чат больше недоступен.",
+            )
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data.startswith("report:"))
 async def report_profile(callback: CallbackQuery):
-    uid = callback.from_user.id
-
     try:
         target = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await callback.answer()
+        await callback.answer("Некорректная анкета.", show_alert=True)
         return
+
+    uid = callback.from_user.id
 
     if uid == target:
-        await callback.answer()
+        await callback.answer("Нельзя пожаловаться на себя.", show_alert=True)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO reports VALUES (?, ?, ?)",
-            (uid, target, "Жалоба из карточки анкеты"),
-        )
-        await db.commit()
+    await db.execute("""
+        INSERT INTO reports (reporter, reported, reason)
+        VALUES ($1, $2, $3)
+    """, uid, target, "Жалоба из карточки анкеты")
 
     await callback.message.answer(
-        "⚠️ Жалоба принята. Спасибо за помощь в поддержании "
-        "безопасного сообщества."
+        "⚠️ Жалоба записана. Для полноценной модерации "
+        "понадобится отдельная панель администратора."
     )
-    await callback.answer()
+    await callback.answer("Жалоба отправлена")
 
 
 # -------------------- УДАЛЕНИЕ АНКЕТЫ --------------------
@@ -763,134 +716,148 @@ async def delete_profile(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
 
-    await close_chat_sessions(uid)
+    partner = await close_chat_sessions(uid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM profiles WHERE user_id = ?", (uid,)
-        )
-        await db.execute(
-            "DELETE FROM likes WHERE from_id = ? OR to_id = ?",
-            (uid, uid),
-        )
-        await db.execute(
-            "DELETE FROM matches WHERE user1 = ? OR user2 = ?",
-            (uid, uid),
-        )
-        await db.execute(
-            "DELETE FROM blocks WHERE from_id = ? OR to_id = ?",
-            (uid, uid),
-        )
-        await db.execute(
-            "DELETE FROM reports WHERE reporter = ? OR reported = ?",
-            (uid, uid),
-        )
-        await db.commit()
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM profiles WHERE user_id = $1", uid
+            )
+            await conn.execute(
+                "DELETE FROM likes WHERE from_id = $1 OR to_id = $1", uid
+            )
+            await conn.execute(
+                "DELETE FROM matches WHERE user1 = $1 OR user2 = $1", uid
+            )
+            await conn.execute(
+                "DELETE FROM blocks WHERE from_id = $1 OR to_id = $1", uid
+            )
+            await conn.execute(
+                "DELETE FROM reports WHERE reporter = $1 OR reported = $1", uid
+            )
+            await conn.execute(
+                "DELETE FROM chat_sessions WHERE user_id = $1 OR partner_id = $1",
+                uid,
+            )
+
+    if partner is not None:
+        try:
+            await bot.send_message(
+                partner,
+                "Собеседник удалил анкету. Чат завершён.",
+            )
+        except Exception:
+            pass
 
     await message.answer(
-        "🗑 Анкета и связанные данные удалены. "
+        "✅ Анкета и связанные данные удалены.\n"
         "Напиши /start, чтобы начать заново."
     )
 
 
-# -------------------- ПЕРЕДАЧА СООБЩЕНИЙ --------------------
+# -------------------- ПЕРЕСЫЛКА СООБЩЕНИЙ --------------------
 
 @dp.message()
-async def relay_chat_message(message: Message, state: FSMContext):
-    if not message.from_user or message.chat.type != "private":
-        return
-
+async def relay_message(message: Message):
     uid = message.from_user.id
 
-    # Команды обрабатываются отдельными обработчиками.
-    if message.text and message.text.startswith("/"):
-        return
-
-    # Не перехватываем сообщения, пока заполняется анкета.
-    if await state.get_state():
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT partner_id FROM chat_sessions WHERE user_id = ?",
-            (uid,),
-        )
-        session = await cur.fetchone()
+    session = await db.fetchrow("""
+        SELECT partner_id
+        FROM chat_sessions
+        WHERE user_id = $1
+    """, uid)
 
     if not session:
         return
 
-    target = session[0]
+    target = session["partner_id"]
+
+    reciprocal = await db.fetchval("""
+        SELECT EXISTS(
+            SELECT 1 FROM chat_sessions
+            WHERE user_id = $1 AND partner_id = $2
+        )
+    """, target, uid)
+
+    if not reciprocal:
+        await message.answer(
+            "⏳ Собеседник ещё не открыл чат. "
+            "Когда он подключится, переписка начнётся."
+        )
+        return
 
     if await is_blocked(uid, target) or not await has_match(uid, target):
-        await close_chat_sessions(uid, target)
-        await message.answer(
-            "Чат больше недоступен. Проверь «Мои чаты»."
-        )
+        await close_chat_sessions(uid)
+        await message.answer("Этот чат больше недоступен.")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT partner_id FROM chat_sessions WHERE user_id = ?",
-            (target,),
-        )
-        reciprocal = await cur.fetchone()
-
-    if not reciprocal or reciprocal[0] != uid:
-        await message.answer(
-            "💌 Запрос отправлен. Дождись, пока собеседник "
-            "тоже откроет чат."
-        )
-        return
-
-    sender = await get_profile(uid)
-
-    if not sender:
-        await message.answer(
-            "Сначала создай анкету командой /start."
-        )
+    profile = await get_profile(uid)
+    if not profile:
+        await close_chat_sessions(uid)
         return
 
     try:
         if message.text:
             await bot.send_message(
                 target,
-                f"💬 {sender['name']}:\n{message.text[:3500]}",
+                f"💬 {profile['name']}:\n{message.text}",
             )
         else:
-            # Копирует фото, видео, документы, стикеры,
-            # голосовые и другие поддерживаемые сообщения.
             await bot.send_message(
                 target,
-                f"💬 Сообщение от {sender['name']}:",
+                f"💬 Сообщение от {profile['name']}:",
             )
             await bot.copy_message(
                 chat_id=target,
-                from_chat_id=message.chat.id,
+                from_chat_id=uid,
                 message_id=message.message_id,
             )
-
     except Exception:
         await message.answer(
-            "Не удалось доставить сообщение. "
-            "Возможно, собеседник больше не может получать сообщения "
-            "от бота."
+            "Не удалось отправить сообщение. "
+            "Возможно, собеседник заблокировал бота."
         )
 
 
 # -------------------- ЗАПУСК --------------------
 
 async def main():
-    global bot
+    global bot, db
 
     if not TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN в переменных окружения хостинга."
-        )
+        raise RuntimeError("Не задана переменная BOT_TOKEN")
+
+    if not DATABASE_URL:
+        raise RuntimeError("Не задана переменная DATABASE_URL")
+
+    # Передаём asyncpg URL без параметров sslmode/channel_binding:
+    # TLS включаем отдельно через ssl="require".
+    parsed = urlsplit(DATABASE_URL)
+    clean_url = urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        "",
+        "",
+    ))
+
+    db = await asyncpg.create_pool(
+        dsn=clean_url,
+        ssl="require",
+        min_size=1,
+        max_size=5,
+    )
+
+    await init_db()
 
     bot = Bot(token=TOKEN)
-    await init_db()
-    await dp.start_polling(bot)
+
+    try:
+        print("VibeMatch подключён к PostgreSQL. Запускаю бота...")
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        await db.close()
 
 
 if __name__ == "__main__":
